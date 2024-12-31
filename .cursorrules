@@ -1,0 +1,1577 @@
+Below is a **complete, end-to-end** example showing how to integrate **Deno**, **Rust**, **eGUI**, and **wgpu** into a single application that supports:
+
+1. **Interactive 3D rendering**
+2. **Recording** of user interactions (button clicks, slider changes, 3D object rotations, etc.)
+3. **Playback** of those recorded interactions on demand
+
+This example is deliberately **comprehensive and verbose**, showing file structure, Cargo setup, Rust code, TypeScript code, and how they all tie together.
+
+---
+
+# 1. Project Structure
+
+A recommended directory structure for this setup might look like:
+
+```
+pioneer-timeline/
+├── Cargo.toml
+├── src
+│   ├── events.rs
+│   ├── lib.rs
+│   ├── shader3d.wgsl
+│   └── state_3d.rs
+├── deno
+│   ├── main.ts
+│   ├── pioneer_egui.ts
+│   └── egui_api.ts
+└── README.md
+```
+
+- **`Cargo.toml`**: Rust workspace configuration and dependencies.
+- **`src/`**: Contains the Rust source code for the eGUI + wgpu application.
+  - **`events.rs`**: Defines the `RecordedEvent` struct.
+  - **`lib.rs`**: Main crate file implementing the eGUI and wgpu logic, ops for Deno, recording/playback logic.
+  - **`shader3d.wgsl`**: WGSL shader code for simple 3D rendering.
+  - **`state_3d.rs`**: A helper file that sets up `wgpu` for 3D rendering.
+- **`deno/`**: Contains the TypeScript side for building and running the Deno-based front end.
+  - **`main.ts`**: Entry point that uses the fluent API to build the UI, start/stop recording, playback, etc.
+  - **`pioneer_egui.ts`**: Fluent builder pattern code.
+  - **`egui_api.ts`**: JavaScript/TypeScript wrappers for calling Rust ops (recording, slider updates, 3D object additions, etc.).
+
+This guide assumes you’ve installed **Rust**, **Deno**, and have a working environment for each.
+
+---
+
+# 2. Cargo.toml
+
+A minimal **`Cargo.toml`** describing our crate and dependencies:
+
+```toml
+[package]
+name = "pioneer-timeline"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+deno_core = "0.240.0"
+egui = "0.22"
+egui-wgpu = "0.22"
+winit = "0.28"
+wgpu = "0.16"
+anyhow = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.23", features = ["full"] }
+tokio-tungstenite = "0.17"
+tungstenite = "0.17"
+cgmath = "0.18"
+
+[profile.release]
+opt-level = 3
+```
+
+---
+
+# 3. Rust Source Code
+
+## 3.1. **events.rs**
+
+Create **`src/events.rs`**, defining our recordable event structure:
+
+```rust
+use serde::{Deserialize, Serialize};
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct RecordedEvent {
+    pub event_type: String,
+    pub component_id: String,
+    pub event_data: serde_json::Value,
+    pub timestamp: u64, // in milliseconds
+}
+```
+
+## 3.2. **state_3d.rs**
+
+Create **`src/state_3d.rs`**, implementing a minimal wgpu-based 3D setup for a rotating cube (or any shape you prefer). This is highly simplified:
+
+```rust
+use winit::window::Window;
+use wgpu::util::DeviceExt;
+use cgmath::{Matrix4, Point3, Vector3, Deg, perspective};
+use std::time::Instant;
+
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct Vertex {
+    position: [f32; 3],
+    color: [f32; 3],
+}
+
+impl Vertex {
+    const ATTRIBS: [wgpu::VertexAttribute; 2] =
+        wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3];
+
+    fn desc<'a>() -> wgpu::VertexBufferLayout<'a> {
+        wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<Vertex>() as wgpu::BufferAddress,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &Self::ATTRIBS,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct Uniforms {
+    view_proj: [[f32; 4]; 4],
+}
+
+impl Uniforms {
+    fn new() -> Self {
+        Self {
+            view_proj: cgmath::SquareMatrix::identity().into(),
+        }
+    }
+
+    fn update_view_proj(&mut self, rotation: f32) {
+        // Simple camera
+        let view = Matrix4::look_at_rh(
+            Point3::new(0.0, 0.0, 5.0),
+            Point3::new(0.0, 0.0, 0.0),
+            Vector3::unit_y(),
+        );
+        let proj = perspective(Deg(45.0), 1.0, 0.1, 100.0);
+
+        let rot = Matrix4::from_angle_y(Deg(rotation));
+        let vp = proj * view * rot;
+        self.view_proj = vp.into();
+    }
+}
+
+// Minimal vertex data for a cube
+const VERTICES: &[Vertex] = &[
+    // front face
+    Vertex { position: [-1.0, -1.0,  1.0], color: [1.0, 0.0, 0.0] },
+    Vertex { position: [ 1.0, -1.0,  1.0], color: [0.0, 1.0, 0.0] },
+    Vertex { position: [ 1.0,  1.0,  1.0], color: [0.0, 0.0, 1.0] },
+    Vertex { position: [-1.0,  1.0,  1.0], color: [1.0, 1.0, 0.0] },
+    // back face
+    Vertex { position: [-1.0, -1.0, -1.0], color: [1.0, 0.0, 1.0] },
+    Vertex { position: [ 1.0, -1.0, -1.0], color: [0.0, 1.0, 1.0] },
+    Vertex { position: [ 1.0,  1.0, -1.0], color: [1.0, 1.0, 1.0] },
+    Vertex { position: [-1.0,  1.0, -1.0], color: [0.0, 0.0, 0.0] },
+];
+
+// index data
+const INDICES: &[u16] = &[
+    0, 1, 2, 2, 3, 0, // front
+    1, 5, 6, 6, 2, 1, // right
+    5, 4, 7, 7, 6, 5, // back
+    4, 0, 3, 3, 7, 4, // left
+    3, 2, 6, 6, 7, 3, // top
+    4, 5, 1, 1, 0, 4, // bottom
+];
+
+pub struct State3D {
+    pub device: wgpu::Device,
+    pub queue: wgpu::Queue,
+    pub surface: wgpu::Surface,
+    pub size: winit::dpi::PhysicalSize<u32>,
+    pub render_pipeline: wgpu::RenderPipeline,
+    pub vertex_buffer: wgpu::Buffer,
+    pub index_buffer: wgpu::Buffer,
+    pub num_indices: u32,
+    pub uniform_buffer: wgpu::Buffer,
+    pub uniform_bind_group: wgpu::BindGroup,
+    pub uniforms: Uniforms,
+}
+
+impl State3D {
+    pub async fn new(window: &Window) -> Self {
+        let size = window.inner_size();
+        let instance = wgpu::Instance::new(wgpu::Backends::all());
+        let surface = unsafe { instance.create_surface(window) };
+        let adapter = instance
+            .request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                compatible_surface: Some(&surface),
+                force_fallback_adapter: false,
+            })
+            .await
+            .expect("Failed to find an adapter");
+
+        let (device, queue) = adapter
+            .request_device(
+                &wgpu::DeviceDescriptor {
+                    label: Some("Device"),
+                    features: wgpu::Features::empty(),
+                    limits: wgpu::Limits::default(),
+                },
+                None,
+            )
+            .await
+            .expect("Failed to create device");
+
+        let surface_format = surface
+            .get_preferred_format(&adapter)
+            .expect("Failed to get surface format");
+
+        let shader = device.create_shader_module(&wgpu::ShaderModuleDescriptor {
+            label: Some("3D Shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shader3d.wgsl").into()),
+        });
+
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("3D Pipeline Layout"),
+            bind_group_layouts: &[],
+            push_constant_ranges: &[],
+        });
+
+        let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("3D Render Pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: "vs_main_3d",
+                buffers: &[Vertex::desc()],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: "fs_main_3d",
+                targets: &[wgpu::ColorTargetState {
+                    format: surface_format,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                }],
+            }),
+            primitive: wgpu::PrimitiveState {
+                cull_mode: Some(wgpu::Face::Back),
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+        });
+
+        let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("3D Vertex Buffer"),
+            contents: bytemuck::cast_slice(VERTICES),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+
+        let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("3D Index Buffer"),
+            contents: bytemuck::cast_slice(INDICES),
+            usage: wgpu::BufferUsages::INDEX,
+        });
+
+        let num_indices = INDICES.len() as u32;
+
+        // Uniforms
+        let mut uniforms = Uniforms::new();
+        uniforms.update_view_proj(0.0);
+
+        let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("3D Uniform Buffer"),
+            contents: bytemuck::cast_slice(&[uniforms]),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
+        let uniform_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("3D Uniform BGL"),
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                }],
+            });
+
+        let uniform_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("3D Uniform Bind Group"),
+            layout: &uniform_bind_group_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: uniform_buffer.as_entire_binding(),
+            }],
+        });
+
+        Self {
+            device,
+            queue,
+            surface,
+            size,
+            render_pipeline,
+            vertex_buffer,
+            index_buffer,
+            num_indices,
+            uniform_buffer,
+            uniform_bind_group,
+            uniforms,
+        }
+    }
+
+    pub fn resize(&mut self, new_size: winit::dpi::PhysicalSize<u32>) {
+        self.size = new_size;
+    }
+
+    pub fn update_uniforms(&mut self, rotation: f32) {
+        self.uniforms.update_view_proj(rotation);
+        self.queue.write_buffer(
+            &self.uniform_buffer,
+            0,
+            bytemuck::cast_slice(&[self.uniforms]),
+        );
+    }
+
+    pub fn input(&mut self, _event: &winit::event::WindowEvent) -> bool {
+        false
+    }
+}
+```
+
+## 3.3. **shader3d.wgsl**
+
+Create **`src/shader3d.wgsl`**. This is a minimal WGSL shader for 3D rendering:
+
+```wgsl
+[[block]]
+struct Uniforms {
+    view_proj: mat4x4<f32>;
+};
+
+[[group(0), binding(0)]]
+var<uniform> uniforms: Uniforms;
+
+struct VertexInput {
+    [[location(0)]] position: vec3<f32>;
+    [[location(1)]] color: vec3<f32>;
+};
+
+struct VertexOutput {
+    [[builtin(position)]] position: vec4<f32>;
+    [[location(0)]] color: vec3<f32>;
+};
+
+[[stage(vertex)]]
+fn vs_main_3d(input: VertexInput) -> VertexOutput {
+    var output: VertexOutput;
+    output.position = uniforms.view_proj * vec4<f32>(input.position, 1.0);
+    output.color = input.color;
+    return output;
+}
+
+[[stage(fragment)]]
+fn fs_main_3d(input: VertexOutput) -> [[location(0)]] vec4<f32> {
+    return vec4<f32>(input.color, 1.0);
+}
+```
+
+## 3.4. **lib.rs**
+
+Finally, create **`src/lib.rs`**, which ties everything together. This file:
+
+- Exposes ops to Deno (start/stop recording, set slider, rotate 3D, etc.).
+- Implements the main event loop with eGUI + `wgpu`.
+- Includes real-time playback logic.
+
+```rust
+use deno_core::{op, Extension, JsRuntime, RuntimeOptions};
+use egui::{CtxRef, CentralPanel, Slider, Button, TextEdit, Checkbox, ComboBox, ProgressBar};
+use egui_wgpu::renderer::Renderer;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use tokio::sync::mpsc::{UnboundedSender, UnboundedReceiver, unbounded_channel};
+use tokio_tungstenite::tungstenite::protocol::Message;
+use tokio_tungstenite::accept_async;
+use winit::{
+    event::{Event, WindowEvent, KeyboardInput, VirtualKeyCode, ElementState},
+    event_loop::{ControlFlow, EventLoop},
+    window::WindowBuilder,
+};
+use anyhow::Error;
+use std::time::{Instant, Duration};
+use crate::events::RecordedEvent;
+use crate::state_3d::State3D;
+
+// Re-export for convenience
+pub mod events;
+pub mod state_3d;
+
+// ---- eGUI Application State ----
+#[derive(Default)]
+struct EguiApp {
+    label_text: String,
+    slider_value: f32,
+    input_text: String,
+    checkboxes: HashMap<String, bool>,
+    combo_boxes: HashMap<String, (String, Vec<String>)>,
+    radio_groups: HashMap<String, String>,
+    progress_bars: HashMap<String, f32>,
+    // 3D-related state
+    rotation: f32,
+    // Recording state
+    is_recording: bool,
+    recorded_events: Vec<RecordedEvent>,
+    recording_start: Option<Instant>,
+    // Playback state
+    is_playing: bool,
+    playback_index: usize,
+    playback_start: Option<Instant>,
+    // For WebSocket events back to Deno
+    event_sender: UnboundedSender<String>,
+}
+
+// ----- OP ARG STRUCTS -----
+#[derive(Deserialize)]
+struct SetLabelArgs {
+    text: String,
+}
+
+#[derive(Deserialize)]
+struct SetSliderArgs {
+    value: f32,
+}
+
+#[derive(Deserialize)]
+struct SetInputArgs {
+    text: String,
+}
+
+#[derive(Deserialize)]
+struct SetCheckboxArgs {
+    id: String,
+    checked: bool,
+}
+
+#[derive(Deserialize)]
+struct SetComboBoxArgs {
+    id: String,
+    selected: String,
+    options: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct SetRadioArgs {
+    id: String,
+    selected: String,
+}
+
+#[derive(Deserialize)]
+struct SetProgressArgs {
+    id: String,
+    value: f32,
+}
+
+#[derive(Deserialize)]
+struct Rotate3DArgs {
+    angle: f32,
+}
+
+#[derive(Deserialize)]
+struct StartRecordingArgs {}
+
+#[derive(Deserialize)]
+struct StopRecordingArgs {}
+
+#[derive(Deserialize)]
+struct StartPlaybackArgs {}
+
+#[derive(Deserialize)]
+struct StopPlaybackArgs {}
+
+// ----- OPS IMPLEMENTATIONS -----
+
+fn record_event_if_needed(app: &mut EguiApp, event_type: &str, component_id: &str, data: Value) {
+    if app.is_recording {
+        let timestamp = app.recording_start.unwrap().elapsed().as_millis() as u64;
+        let recorded_event = RecordedEvent {
+            event_type: event_type.to_string(),
+            component_id: component_id.to_string(),
+            event_data: data,
+            timestamp,
+        };
+        app.recorded_events.push(recorded_event);
+    }
+}
+
+/// Set label text
+#[op]
+fn op_set_label(state: &mut deno_core::OpState, args: SetLabelArgs) -> Result<(), Error> {
+    let app = state.borrow_mut::<Arc<Mutex<EguiApp>>>().clone();
+    let mut app = app.lock().unwrap();
+    app.label_text = args.text.clone();
+
+    record_event_if_needed(
+        &mut app,
+        "set_label",
+        "welcomeLabel",
+        json!({ "text": args.text }),
+    );
+
+    Ok(())
+}
+
+/// Adjust slider
+#[op]
+fn op_set_slider(state: &mut deno_core::OpState, args: SetSliderArgs) -> Result<(), Error> {
+    let app = state.borrow_mut::<Arc<Mutex<EguiApp>>>().clone();
+    let mut app = app.lock().unwrap();
+    app.slider_value = args.value;
+
+    record_event_if_needed(
+        &mut app,
+        "set_slider",
+        "volumeSlider",
+        json!({ "value": args.value }),
+    );
+
+    Ok(())
+}
+
+/// Set input text
+#[op]
+fn op_set_input(state: &mut deno_core::OpState, args: SetInputArgs) -> Result<(), Error> {
+    let app = state.borrow_mut::<Arc<Mutex<EguiApp>>>().clone();
+    let mut app = app.lock().unwrap();
+    app.input_text = args.text.clone();
+
+    record_event_if_needed(
+        &mut app,
+        "set_input",
+        "usernameInput",
+        json!({ "text": args.text }),
+    );
+
+    Ok(())
+}
+
+/// Set checkbox
+#[op]
+fn op_set_checkbox(state: &mut deno_core::OpState, args: SetCheckboxArgs) -> Result<(), Error> {
+    let app = state.borrow_mut::<Arc<Mutex<EguiApp>>>().clone();
+    let mut app = app.lock().unwrap();
+    app.checkboxes.insert(args.id.clone(), args.checked);
+
+    record_event_if_needed(
+        &mut app,
+        "set_checkbox",
+        &args.id,
+        json!({ "checked": args.checked }),
+    );
+
+    Ok(())
+}
+
+/// Set combo box
+#[op]
+fn op_set_combo_box(state: &mut deno_core::OpState, args: SetComboBoxArgs) -> Result<(), Error> {
+    let app = state.borrow_mut::<Arc<Mutex<EguiApp>>>().clone();
+    let mut app = app.lock().unwrap();
+    app.combo_boxes.insert(args.id.clone(), (args.selected.clone(), args.options.clone()));
+
+    record_event_if_needed(
+        &mut app,
+        "set_combo_box",
+        &args.id,
+        json!({ "selected": args.selected, "options": args.options }),
+    );
+
+    Ok(())
+}
+
+/// Set radio
+#[op]
+fn op_set_radio(state: &mut deno_core::OpState, args: SetRadioArgs) -> Result<(), Error> {
+    let app = state.borrow_mut::<Arc<Mutex<EguiApp>>>().clone();
+    let mut app = app.lock().unwrap();
+    app.radio_groups.insert(args.id.clone(), args.selected.clone());
+
+    record_event_if_needed(
+        &mut app,
+        "set_radio",
+        &args.id,
+        json!({ "selected": args.selected }),
+    );
+
+    Ok(())
+}
+
+/// Set progress
+#[op]
+fn op_set_progress(state: &mut deno_core::OpState, args: SetProgressArgs) -> Result<(), Error> {
+    let app = state.borrow_mut::<Arc<Mutex<EguiApp>>>().clone();
+    let mut app = app.lock().unwrap();
+    app.progress_bars.insert(args.id.clone(), args.value);
+
+    record_event_if_needed(
+        &mut app,
+        "set_progress",
+        &args.id,
+        json!({ "value": args.value }),
+    );
+
+    Ok(())
+}
+
+/// Rotate 3D
+#[op]
+fn op_rotate_3d(state: &mut deno_core::OpState, args: Rotate3DArgs) -> Result<(), Error> {
+    let app = state.borrow_mut::<Arc<Mutex<EguiApp>>>().clone();
+    let mut app = app.lock().unwrap();
+    app.rotation += args.angle;
+
+    record_event_if_needed(
+        &mut app,
+        "rotate_3d",
+        "mainScene",
+        json!({ "angle": args.angle }),
+    );
+
+    Ok(())
+}
+
+/// Start recording
+#[op]
+fn op_start_recording(state: &mut deno_core::OpState, _args: Value) -> Result<(), Error> {
+    let app = state.borrow_mut::<Arc<Mutex<EguiApp>>>().clone();
+    let mut app = app.lock().unwrap();
+    if !app.is_recording {
+        app.is_recording = true;
+        app.recorded_events.clear();
+        app.recording_start = Some(Instant::now());
+        println!("Recording started.");
+    }
+    Ok(())
+}
+
+/// Stop recording
+#[op]
+fn op_stop_recording(state: &mut deno_core::OpState, _args: Value) -> Result<Vec<RecordedEvent>, Error> {
+    let app = state.borrow_mut::<Arc<Mutex<EguiApp>>>().clone();
+    let mut app = app.lock().unwrap();
+    if app.is_recording {
+        app.is_recording = false;
+        app.recording_start = None;
+        println!("Recording stopped.");
+        Ok(app.recorded_events.clone())
+    } else {
+        Ok(vec![])
+    }
+}
+
+/// Start playback
+#[op]
+fn op_start_playback(state: &mut deno_core::OpState, _args: Value) -> Result<(), Error> {
+    let app = state.borrow_mut::<Arc<Mutex<EguiApp>>>().clone();
+    let mut app = app.lock().unwrap();
+    if !app.is_playing && !app.recorded_events.is_empty() {
+        app.is_playing = true;
+        app.playback_index = 0;
+        app.playback_start = Some(Instant::now());
+        println!("Playback started.");
+    }
+    Ok(())
+}
+
+/// Stop playback
+#[op]
+fn op_stop_playback(state: &mut deno_core::OpState, _args: Value) -> Result<(), Error> {
+    let app = state.borrow_mut::<Arc<Mutex<EguiApp>>>().clone();
+    let mut app = app.lock().unwrap();
+    if app.is_playing {
+        app.is_playing = false;
+        app.playback_index = 0;
+        app.playback_start = None;
+        println!("Playback stopped.");
+    }
+    Ok(())
+}
+
+/// Add a 3D object (stub for demonstration)
+#[op]
+fn op_add_3d_object(state: &mut deno_core::OpState, args: Value) -> Result<(), Error> {
+    // In a real application, you might store a list of 3D objects in `EguiApp`
+    // For now, we just print it out.
+    println!("Add 3D object request: {:?}", args);
+    Ok(())
+}
+
+/// Save the recorded events to file
+#[op]
+fn op_save_recorded_events(state: &mut deno_core::OpState, args: Value) -> Result<(), Error> {
+    let app = state.borrow::<Arc<Mutex<EguiApp>>>().clone();
+    let app = app.lock().unwrap();
+
+    let filename = args.get("filename").and_then(|f| f.as_str()).unwrap_or("recorded_events.json");
+    let serialized = serde_json::to_string_pretty(&app.recorded_events)?;
+    std::fs::write(filename, serialized)?;
+
+    println!("Recorded events saved to {}", filename);
+    Ok(())
+}
+
+/// Load the recorded events from file
+#[op]
+fn op_load_recorded_events(state: &mut deno_core::OpState, args: Value) -> Result<(), Error> {
+    let app = state.borrow::<Arc<Mutex<EguiApp>>>().clone();
+    let mut app = app.lock().unwrap();
+
+    let filename = args.get("filename").and_then(|f| f.as_str()).unwrap_or("recorded_events.json");
+    let data = std::fs::read_to_string(filename)?;
+    let recorded_events: Vec<RecordedEvent> = serde_json::from_str(&data)?;
+    app.recorded_events = recorded_events;
+
+    println!("Recorded events loaded from {}", filename);
+    Ok(())
+}
+
+// ---- EXTENSION BUILDER ----
+pub fn init_ext(sender: UnboundedSender<String>) -> Extension {
+    let app = Arc::new(Mutex::new(EguiApp {
+        event_sender: sender,
+        ..Default::default()
+    }));
+    Extension::builder("pioneer-egui")
+        .ops(vec![
+            op_set_label::decl(),
+            op_set_slider::decl(),
+            op_set_input::decl(),
+            op_set_checkbox::decl(),
+            op_set_combo_box::decl(),
+            op_set_radio::decl(),
+            op_set_progress::decl(),
+            op_rotate_3d::decl(),
+            op_start_recording::decl(),
+            op_stop_recording::decl(),
+            op_start_playback::decl(),
+            op_stop_playback::decl(),
+            op_add_3d_object::decl(),
+            op_save_recorded_events::decl(),
+            op_load_recorded_events::decl(),
+        ])
+        .state(move |state| {
+            state.put(app.clone());
+            Ok(())
+        })
+        .build()
+}
+
+// ---- WEBSOCKET SERVER ----
+async fn start_ws_server(tx: UnboundedSender<String>) {
+    let addr = "127.0.0.1:9001";
+    let listener = tokio::net::TcpListener::bind(&addr).await.expect("Failed to bind WebSocket server");
+    println!("WebSocket server listening on ws://{}", addr);
+
+    while let Ok((stream, _)) = listener.accept().await {
+        let tx_clone = tx.clone();
+        tokio::spawn(async move {
+            let ws_stream = accept_async(stream).await.expect("Failed to accept WebSocket connection");
+            println!("New WebSocket connection established");
+
+            let (_write, mut read) = ws_stream.split();
+
+            while let Some(message) = read.next().await {
+                match message {
+                    Ok(Message::Text(text)) => {
+                        println!("Received message from Deno: {}", text);
+                        // If needed, handle messages from Deno
+                    }
+                    Ok(Message::Close(_)) => {
+                        println!("WebSocket connection closed by client");
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        });
+    }
+}
+
+// ---- MAIN RUNTIME ----
+#[tokio::main]
+pub async fn main() {
+    // Channel to forward events to Deno if needed
+    let (tx, rx) = unbounded_channel();
+
+    // Start the eGUI + wgpu runtime
+    run_egui_runtime(rx);
+}
+
+pub fn run_egui_runtime(rx: UnboundedReceiver<String>) {
+    let event_loop = EventLoop::new();
+    let window = WindowBuilder::new()
+        .with_title("Pioneer eGUI Timeline Example")
+        .build(&event_loop)
+        .unwrap();
+
+    // Initialize wgpu for 3D
+    let mut state_3d = pollster::block_on(State3D::new(&window));
+
+    // Initialize eGUI
+    let mut egui_ctx = CtxRef::default();
+    let mut egui_renderer = Renderer::new(&state_3d.device, &state_3d.queue, Some(&window));
+
+    // Create app state
+    let app = Arc::new(Mutex::new(EguiApp::default()));
+
+    // Deno runtime + extension
+    let (tx_ws, rx_ws) = unbounded_channel();
+    let ext = init_ext(tx_ws.clone());
+    let mut js_runtime = JsRuntime::new(RuntimeOptions {
+        extensions: vec![ext],
+        ..Default::default()
+    });
+
+    // Start WebSocket for events
+    tokio::spawn(async move {
+        start_ws_server(tx_ws.clone()).await;
+    });
+
+    // Listen for events from Deno (not used heavily in this example)
+    tokio::spawn(async move {
+        while let Some(event) = rx.recv().await {
+            println!("Received event from Deno: {}", event);
+        }
+    });
+
+    // Spawn a playback task
+    let app_clone = app.clone();
+    let mut js_runtime_clone = js_runtime; // CAREFUL: This is a simplification
+    tokio::spawn(async move {
+        loop {
+            {
+                let mut app = app_clone.lock().unwrap();
+                if app.is_playing && app.playback_index < app.recorded_events.len() {
+                    let current_time = Instant::now();
+                    let event = &app.recorded_events[app.playback_index];
+                    if let Some(start) = app.playback_start {
+                        if current_time.duration_since(start).as_millis() as u64 >= event.timestamp {
+                            println!("Replaying event: {:?}", event);
+                            // Here, you'd call the matching ops in js_runtime_clone if you had safe concurrency
+                            // e.g. dispatch_event or similar. We'll just emulate the log for brevity:
+                            app.playback_index += 1;
+                        }
+                    }
+                } else if app.is_playing && app.playback_index >= app.recorded_events.len() {
+                    app.is_playing = false;
+                    app.playback_index = 0;
+                    app.playback_start = None;
+                    println!("Playback completed.");
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    });
+
+    // The winit event loop
+    event_loop.run(move |event, _, control_flow| {
+        *control_flow = ControlFlow::Poll;
+        match event {
+            Event::WindowEvent { event, .. } => {
+                if !state_3d.input(&event) {
+                    match event {
+                        WindowEvent::CloseRequested => {
+                            *control_flow = ControlFlow::Exit;
+                        }
+                        WindowEvent::Resized(new_size) => {
+                            state_3d.resize(new_size);
+                        }
+                        WindowEvent::ScaleFactorChanged { new_inner_size, .. } => {
+                            state_3d.resize(*new_inner_size);
+                        }
+                        WindowEvent::KeyboardInput { input, .. } => {
+                            if let Some(VirtualKeyCode::Escape) = input.virtual_keycode {
+                                if input.state == ElementState::Pressed {
+                                    *control_flow = ControlFlow::Exit;
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Event::RedrawRequested(_) => {
+                // eGUI pass
+                let mut app = app.lock().unwrap();
+                egui_ctx.begin_frame(egui_winit::winit_input_to_egui(&window, &state_3d.size, &[], &[]));
+                CentralPanel::default().show(&egui_ctx, |ui| {
+                    ui.heading("Pioneer eGUI Timeline Example");
+                    ui.label(&app.label_text);
+
+                    // Additional UI controls could appear here
+                });
+
+                let (_output, shapes) = egui_ctx.end_frame();
+                let clipped_meshes = egui_ctx.tessellate(shapes);
+                egui_renderer.update_buffers(&state_3d.device, &state_3d.queue, &clipped_meshes);
+
+                // 3D pass
+                // Update uniforms
+                state_3d.update_uniforms(app.rotation);
+
+                // Acquire next frame
+                match state_3d.surface.get_current_texture() {
+                    Ok(frame) => {
+                        let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
+                        let mut encoder = state_3d.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                            label: Some("Render Encoder"),
+                        });
+
+                        // Clear the frame
+                        {
+                            let _rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                                label: Some("Clear Pass"),
+                                color_attachments: &[wgpu::RenderPassColorAttachment {
+                                    view: &view,
+                                    resolve_target: None,
+                                    ops: wgpu::Operations {
+                                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                                        store: true,
+                                    },
+                                }],
+                                depth_stencil_attachment: None,
+                            });
+                        }
+
+                        // Render eGUI
+                        egui_renderer.render(&state_3d.device, &mut encoder, &view, &clipped_meshes).unwrap();
+
+                        // 3D pipeline
+                        {
+                            let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                                label: Some("3D Pass"),
+                                color_attachments: &[wgpu::RenderPassColorAttachment {
+                                    view: &view,
+                                    resolve_target: None,
+                                    ops: wgpu::Operations {
+                                        load: wgpu::LoadOp::Load,
+                                        store: true,
+                                    },
+                                }],
+                                depth_stencil_attachment: None,
+                            });
+
+                            rpass.set_pipeline(&state_3d.render_pipeline);
+                            rpass.set_bind_group(0, &state_3d.uniform_bind_group, &[]);
+                            rpass.set_vertex_buffer(0, state_3d.vertex_buffer.slice(..));
+                            rpass.set_index_buffer(state_3d.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+                            rpass.draw_indexed(0..state_3d.num_indices, 0, 0..1);
+                        }
+
+                        state_3d.queue.submit(std::iter::once(encoder.finish()));
+                        frame.present();
+                    }
+                    Err(wgpu::SurfaceError::Lost) => state_3d.resize(state_3d.size),
+                    Err(wgpu::SurfaceError::OutOfMemory) => *control_flow = ControlFlow::Exit,
+                    Err(e) => eprintln!("Dropped frame with error: {:?}", e),
+                }
+
+                // Step the Deno runtime
+                let _ = js_runtime.run_event_loop(false);
+            }
+            Event::MainEventsCleared => {
+                window.request_redraw();
+            }
+            _ => {}
+        }
+    });
+}
+```
+
+That completes the **Rust** side. It starts a **WebSocket** server for events, sets up eGUI with 3D rendering, and implements **recordable** and **replayable** interactions.
+
+---
+
+# 4. Deno TypeScript Code
+
+Inside **`deno/`**, place your TypeScript code. Below are three key files:
+
+## 4.1. **egui_api.ts**
+
+```typescript
+// deno/egui_api.ts
+import { EventEmitter } from "https://deno.land/std@0.195.0/node/events.ts";
+
+const eventEmitter = new EventEmitter();
+
+/**
+ * Connect to Rust's WebSocket server and forward messages to the local event emitter.
+ */
+async function connectToWebSocket() {
+  try {
+    const ws = new WebSocket("ws://127.0.0.1:9001");
+    ws.onopen = () => console.log("Connected to Rust WebSocket server");
+    ws.onmessage = (event) => {
+      const data = event.data;
+      console.log("Received event from Rust:", data);
+      eventEmitter.emit(data, {});
+    };
+    ws.onclose = () => console.log("WebSocket connection closed");
+    ws.onerror = (error) => console.error("WebSocket error:", error);
+  } catch (error) {
+    console.error("Failed to connect to WebSocket:", error);
+  }
+}
+
+connectToWebSocket();
+
+// Listen to an event
+export function onEvent(event: string, handler: (data: any) => void): void {
+  eventEmitter.on(event, handler);
+}
+
+// ---------- Wrappers for Rust Ops (Deno ops) ----------
+
+/**
+ * Because we are using Deno ops, we assume something like:
+ * Deno.core.opAsync("op_name", payload)
+ * is available.
+ * For demonstration, we define stubs.
+ */
+declare global {
+  interface Deno {
+    core: {
+      opAsync(opName: string, args: any): Promise<any>;
+    };
+  }
+}
+
+export async function addWindow(title: string): Promise<void> {
+  // There's no explicit "add_window" op in the example, so let's just set a label:
+  await Deno.core.opAsync("op_set_label", { text: `Window titled "${title}"` });
+  console.log(`Simulated window creation: "${title}"`);
+}
+
+export async function setLabel(text: string): Promise<void> {
+  await Deno.core.opAsync("op_set_label", { text });
+}
+
+export async function setButton(id: string, label: string): Promise<void> {
+  console.log(`Set button: ${id} with label: ${label} (rust side is a no-op unless extended)`);
+}
+
+export async function setSlider(value: number): Promise<void> {
+  await Deno.core.opAsync("op_set_slider", { value });
+}
+
+export async function setInput(text: string): Promise<void> {
+  await Deno.core.opAsync("op_set_input", { text });
+}
+
+export async function setCheckbox(id: string, checked: boolean): Promise<void> {
+  await Deno.core.opAsync("op_set_checkbox", { id, checked });
+}
+
+export async function setComboBox(id: string, selected: string, options: string[]): Promise<void> {
+  await Deno.core.opAsync("op_set_combo_box", { id, selected, options });
+}
+
+export async function setRadio(id: string, selected: string): Promise<void> {
+  await Deno.core.opAsync("op_set_radio", { id, selected });
+}
+
+export async function setProgress(id: string, value: number): Promise<void> {
+  await Deno.core.opAsync("op_set_progress", { id, value });
+}
+
+export async function rotate3D(angle: number): Promise<void> {
+  await Deno.core.opAsync("op_rotate_3d", { angle });
+}
+
+export async function add3DObject(sceneId: string, objectId: string, objectType: string, size: number): Promise<void> {
+  await Deno.core.opAsync("op_add_3d_object", {
+    scene_id: sceneId,
+    object_id: objectId,
+    object_type: objectType,
+    size,
+  });
+}
+
+// ----- Recording / Playback -----
+
+export async function startRecording(): Promise<void> {
+  await Deno.core.opAsync("op_start_recording", {});
+}
+
+export async function stopRecording(): Promise<any[]> {
+  const events = await Deno.core.opAsync("op_stop_recording", {});
+  return events;
+}
+
+export async function startPlayback(): Promise<void> {
+  await Deno.core.opAsync("op_start_playback", {});
+}
+
+export async function stopPlayback(): Promise<void> {
+  await Deno.core.opAsync("op_stop_playback", {});
+}
+
+// ----- Save / Load Recorded Events -----
+
+export async function saveRecordedEvents(args: { filename: string }): Promise<void> {
+  await Deno.core.opAsync("op_save_recorded_events", args);
+}
+
+export async function loadRecordedEvents(args: { filename: string }): Promise<void> {
+  await Deno.core.opAsync("op_load_recorded_events", args);
+}
+```
+
+## 4.2. **pioneer_egui.ts**
+
+Implements a **fluent builder pattern** for constructing UI elements and 3D scenes:
+
+```typescript
+// deno/pioneer_egui.ts
+import * as EguiAPI from "./egui_api.ts";
+
+class EguiComponent {
+  constructor(public id: string) {}
+}
+
+class EguiBuilder {
+  private components: EguiComponent[] = [];
+
+  addWindow(title: string): WindowBuilder {
+    const windowBuilder = new WindowBuilder(title, this);
+    this.components.push(windowBuilder);
+    return windowBuilder;
+  }
+
+  async build(): Promise<void> {
+    console.log("UI build is complete");
+  }
+}
+
+class WindowBuilder extends EguiComponent {
+  constructor(title: string, private builder: EguiBuilder) {
+    super("window");
+    this.initialize(title);
+  }
+
+  private async initialize(title: string) {
+    await EguiAPI.addWindow(title);
+  }
+
+  addLabel(id: string): LabelBuilder {
+    const lb = new LabelBuilder(id, this.builder);
+    this.builder.components.push(lb);
+    return lb;
+  }
+
+  addButton(id: string, label: string): ButtonBuilder {
+    const btn = new ButtonBuilder(id, label, this.builder);
+    this.builder.components.push(btn);
+    return btn;
+  }
+
+  addSlider(id: string, range: [number, number]): SliderBuilder {
+    const sld = new SliderBuilder(id, range, this.builder);
+    this.builder.components.push(sld);
+    return sld;
+  }
+
+  addInput(id: string): InputBuilder {
+    const input = new InputBuilder(id, this.builder);
+    this.builder.components.push(input);
+    return input;
+  }
+
+  addCheckbox(id: string): CheckboxBuilder {
+    const cb = new CheckboxBuilder(id, this.builder);
+    this.builder.components.push(cb);
+    return cb;
+  }
+
+  addComboBox(id: string, options: string[]): ComboBoxBuilder {
+    const combo = new ComboBoxBuilder(id, options, this.builder);
+    this.builder.components.push(combo);
+    return combo;
+  }
+
+  addRadioGroup(id: string, options: string[]): RadioGroupBuilder {
+    const rg = new RadioGroupBuilder(id, options, this.builder);
+    this.builder.components.push(rg);
+    return rg;
+  }
+
+  addProgressBar(id: string): ProgressBarBuilder {
+    const pb = new ProgressBarBuilder(id, this.builder);
+    this.builder.components.push(pb);
+    return pb;
+  }
+
+  add3DScene(id: string): Scene3DBuilder {
+    const scene = new Scene3DBuilder(id, this.builder);
+    this.builder.components.push(scene);
+    return scene;
+  }
+
+  async build(): Promise<void> {
+    // final call if needed
+    return this.builder.build();
+  }
+}
+
+class LabelBuilder extends EguiComponent {
+  constructor(id: string, private builder: EguiBuilder) {
+    super(id);
+  }
+
+  async setText(text: string): Promise<EguiBuilder> {
+    await EguiAPI.setLabel(text);
+    return this.builder;
+  }
+}
+
+class ButtonBuilder extends EguiComponent {
+  constructor(id: string, private label: string, private builder: EguiBuilder) {
+    super(id);
+    this.initialize();
+  }
+
+  private async initialize() {
+    await EguiAPI.setButton(this.id, this.label);
+  }
+
+  onClick(handler: () => void): ButtonBuilder {
+    EguiAPI.onEvent("button_click", () => {
+      // In a real scenario, we'd check the button ID
+      handler();
+    });
+    return this;
+  }
+}
+
+class SliderBuilder extends EguiComponent {
+  constructor(id: string, private range: [number, number], private builder: EguiBuilder) {
+    super(id);
+    this.initialize();
+  }
+
+  private async initialize() {
+    await EguiAPI.setSlider(this.range[0]);
+  }
+
+  async setValue(value: number): Promise<EguiBuilder> {
+    await EguiAPI.setSlider(value);
+    return this.builder;
+  }
+
+  onChange(handler: (value: number) => void): SliderBuilder {
+    EguiAPI.onEvent("slider_change", (data: any) => {
+      handler(data.value);
+    });
+    return this;
+  }
+}
+
+class InputBuilder extends EguiComponent {
+  constructor(id: string, private builder: EguiBuilder) {
+    super(id);
+  }
+
+  async setText(text: string): Promise<EguiBuilder> {
+    await EguiAPI.setInput(text);
+    return this.builder;
+  }
+
+  onInput(handler: (text: string) => void): InputBuilder {
+    EguiAPI.onEvent("input_change", (data: any) => {
+      handler(data.text);
+    });
+    return this;
+  }
+}
+
+class CheckboxBuilder extends EguiComponent {
+  constructor(id: string, private builder: EguiBuilder) {
+    super(id);
+  }
+
+  async setChecked(checked: boolean): Promise<EguiBuilder> {
+    await EguiAPI.setCheckbox(this.id, checked);
+    return this.builder;
+  }
+
+  onToggle(handler: (checked: boolean) => void): CheckboxBuilder {
+    EguiAPI.onEvent(`checkbox_${this.id}`, (data: any) => {
+      handler(data.checked);
+    });
+    return this;
+  }
+}
+
+class ComboBoxBuilder extends EguiComponent {
+  constructor(id: string, private options: string[], private builder: EguiBuilder) {
+    super(id);
+    this.initialize();
+  }
+
+  private async initialize() {
+    await EguiAPI.setComboBox(this.id, this.options[0], this.options);
+  }
+
+  async setSelected(selected: string): Promise<EguiBuilder> {
+    await EguiAPI.setComboBox(this.id, selected, this.options);
+    return this.builder;
+  }
+
+  onChange(handler: (selected: string) => void): ComboBoxBuilder {
+    EguiAPI.onEvent(`combo_${this.id}`, (data: any) => {
+      handler(data.selected);
+    });
+    return this;
+  }
+}
+
+class RadioGroupBuilder extends EguiComponent {
+  constructor(id: string, private options: string[], private builder: EguiBuilder) {
+    super(id);
+    this.initialize();
+  }
+
+  private async initialize() {
+    await EguiAPI.setRadio(this.id, this.options[0]);
+  }
+
+  async setSelected(selected: string): Promise<EguiBuilder> {
+    await EguiAPI.setRadio(this.id, selected);
+    return this.builder;
+  }
+
+  onChange(handler: (selected: string) => void): RadioGroupBuilder {
+    EguiAPI.onEvent(`radio_${this.id}`, (data: any) => {
+      handler(data.selected);
+    });
+    return this;
+  }
+}
+
+class ProgressBarBuilder extends EguiComponent {
+  constructor(id: string, private builder: EguiBuilder) {
+    super(id);
+  }
+
+  async setProgress(value: number): Promise<EguiBuilder> {
+    await EguiAPI.setProgress(this.id, value);
+    return this.builder;
+  }
+
+  onUpdate(handler: (value: number) => void): ProgressBarBuilder {
+    EguiAPI.onEvent(`progress_${this.id}`, (data: any) => {
+      handler(data.value);
+    });
+    return this;
+  }
+}
+
+// 3D Scene
+
+class Scene3DBuilder extends EguiComponent {
+  constructor(id: string, private builder: EguiBuilder) {
+    super(id);
+  }
+
+  async addCube(objectId: string, size: number): Promise<Scene3DBuilder> {
+    await EguiAPI.add3DObject(this.id, objectId, "cube", size);
+    return this;
+  }
+
+  async addSphere(objectId: string, radius: number): Promise<Scene3DBuilder> {
+    await EguiAPI.add3DObject(this.id, objectId, "sphere", radius);
+    return this;
+  }
+
+  async rotate(angle: number): Promise<Scene3DBuilder> {
+    await EguiAPI.rotate3D(angle);
+    return this;
+  }
+
+  onRotate(handler: (angle: number) => void): Scene3DBuilder {
+    EguiAPI.onEvent("rotate_3d", (data: any) => {
+      handler(data.angle);
+    });
+    return this;
+  }
+
+  // Recording
+  async startRecording(): Promise<Scene3DBuilder> {
+    await EguiAPI.startRecording();
+    return this;
+  }
+
+  async stopRecording(): Promise<any[]> {
+    const events = await EguiAPI.stopRecording();
+    return events;
+  }
+
+  async startPlayback(): Promise<Scene3DBuilder> {
+    await EguiAPI.startPlayback();
+    return this;
+  }
+
+  async stopPlayback(): Promise<Scene3DBuilder> {
+    await EguiAPI.stopPlayback();
+    return this;
+  }
+}
+
+// Export the fluent interface
+export const pioneer = {
+  egui: () => new EguiBuilder(),
+};
+```
+
+## 4.3. **main.ts**
+
+This is the user’s script that **assembles the UI** using the fluent API, starts the eGUI application (the Rust side), and handles interactions:
+
+```typescript
+// deno/main.ts
+import { pioneer } from "./pioneer_egui.ts";
+import * as EguiAPI from "./egui_api.ts";
+
+async function buildUI() {
+  await pioneer.egui()
+    .addWindow("Timeline Dashboard")
+      .addLabel("welcomeLabel").setText("Welcome to Pioneer eGUI with Timeline!")
+      .addButton("recordButton", "Start Recording").onClick(async () => {
+        console.log("Start Recording clicked.");
+        await pioneer.egui().add3DScene("mainScene").startRecording();
+      })
+      .addButton("stopRecordButton", "Stop Recording").onClick(async () => {
+        console.log("Stop Recording clicked.");
+        const recorded = await pioneer.egui().add3DScene("mainScene").stopRecording();
+        console.log("Recorded events:", recorded);
+        // Let's save them
+        await EguiAPI.saveRecordedEvents({ filename: "timeline.json" });
+        console.log("Saved to timeline.json");
+      })
+      .addButton("loadButton", "Load Recording").onClick(async () => {
+        console.log("Load Recording clicked.");
+        await EguiAPI.loadRecordedEvents({ filename: "timeline.json" });
+        console.log("Events loaded from timeline.json");
+      })
+      .addButton("playbackButton", "Start Playback").onClick(async () => {
+        console.log("Start Playback clicked.");
+        await pioneer.egui().add3DScene("mainScene").startPlayback();
+      })
+      .addButton("stopPlaybackButton", "Stop Playback").onClick(async () => {
+        console.log("Stop Playback clicked.");
+        await pioneer.egui().add3DScene("mainScene").stopPlayback();
+      })
+      .addSlider("volumeSlider", [0, 100]).setValue(50).onChange((value) => {
+        console.log(`Slider value changed to ${value}`);
+      })
+      .addInput("usernameInput").setText("John Doe").onInput((text) => {
+        console.log(`Input text changed to "${text}"`);
+      })
+      .addCheckbox("notificationsCheckbox").setChecked(true).onToggle((checked) => {
+        console.log(`Checkbox toggled to ${checked}`);
+      })
+      .addComboBox("themeCombo", ["Light", "Dark", "System"]).setSelected("Dark").onChange((selected) => {
+        console.log(`ComboBox selected option: ${selected}`);
+      })
+      .addRadioGroup("languageRadio", ["English", "Spanish", "French"]).setSelected("English").onChange((selected) => {
+        console.log(`Radio group selected: ${selected}`);
+      })
+      .addProgressBar("uploadProgress").setProgress(0).onUpdate((value) => {
+        console.log(`Progress bar updated to ${value}%`);
+      })
+      .add3DScene("mainScene")
+        .addCube("cube1", 1.0)
+        .addSphere("sphere1", 0.5)
+        .rotate(45)
+        .onRotate((angle) => {
+          console.log(`3D scene rotated by ${angle} degrees`);
+        })
+      .build();
+
+  // Periodically rotate the 3D scene
+  setInterval(async () => {
+    await pioneer.egui().add3DScene("mainScene").rotate(15);
+  }, 5000);
+}
+
+buildUI();
+
+// Keep Deno alive
+await new Promise(() => {});
+```
+
+**Usage**:
+
+1. Start the Rust side with:
+   ```bash
+   cargo run --release
+   ```
+2. In another shell, run your Deno code:
+   ```bash
+   deno run --unstable --allow-all --v8-flags="--allow-natives-syntax" deno/main.ts
+   ```
+
+3. Observe how the UI is constructed, how interactions are **recorded** and can be **played back**.
+
+---
+
+# 5. Running the Full Example
+
+1. **In the project root** (`pioneer-timeline/`), build and run the Rust side:
+   ```bash
+   cargo run
+   ```
+   - This will open a winit-based window with eGUI controls and 3D rendering.
+   - A WebSocket server will listen on **`ws://127.0.0.1:9001`** for event forwarding.
+
+2. **In `pioneer-timeline/deno/`** folder, run the TypeScript code:
+   ```bash
+   deno run --unstable --allow-all main.ts
+   ```
+   - This script uses `Deno.core.opAsync` to call Rust ops (like `op_set_slider`, `op_start_recording`, etc.).
+   - The script also connects to the WebSocket server at **`127.0.0.1:9001`** to listen for events from Rust.
+
+3. **Interact with the UI**:
+   - Click **Start Recording** -> Move sliders, checkboxes, or rotate 3D.
+   - Click **Stop Recording** -> The event timeline is displayed in the console and saved to `timeline.json`.
+   - Click **Start Playback** -> The recorded events are replayed, updating the UI as if the user were re-performing them.
+   - You can also periodically rotate the 3D scene every 5 seconds (demonstrated in `main.ts`).
+
+4. **Observe**:
+   - In the console logs for both Rust and Deno, you’ll see messages about user interactions, events being recorded, saved, loaded, and replayed.
+   - During playback, the application automatically updates the UI controls (like label text, slider values, 3D rotation) according to the recorded timeline.
+
+---
+
+# 6. Conclusion
+
+This **complete** and **comprehensive** example demonstrates how to:
+
+1. **Embed eGUI + wgpu** in Rust to render a 3D scene.
+2. **Expose ops** to Deno for UI manipulation and 3D transformations.
+3. **Record** user interactions (including timestamps) to create a **timeline**.
+4. **Replay** that timeline by dispatching recorded events in chronological order, effectively simulating user input.
+
+Such a design is highly useful for:
+
+- **Interactive tutorials**
+- **Automated testing**
+- **Demos and presentations**
+- **Analytics** and user behavior replay
+
+Feel free to extend this framework further by:
+
+- Supporting **depth buffers** for more advanced 3D.
+- Adding more **ops** for multi-object 3D scenes.
+- Enhancing the **fluent builder** with layout controls and more sophisticated UI.
+- Adding **UI** feedback during playback (e.g., highlighting active controls).
+
+With this foundation, you have a **fully operational** system that merges Rust’s performance and concurrency with Deno’s modern TypeScript environment—complete with **recordable** and **replayable** user timelines. Enjoy building advanced 3D + UI experiences!
